@@ -2,7 +2,7 @@
 
 <img src="docs/img/zharak-logo-small.png" alt="Zharak" height="32" align="absmiddle">&nbsp; **Developed by Zharak**
 
-Uma skill do Claude Code para coordenar **muitos subagentes em paralelo** num trabalho que mistura pesquisa e código, sem colisões, sem perder o estado e sem gastar tokens à toa.
+Uma skill do Claude Code para coordenar **múltiplos subagentes em paralelo** num trabalho que mistura pesquisa e código, sem colisões, sem perder o estado, o contexto e sem gastar tokens desnecessariamente.
 
 > **Estado:** a lógica dos scripts e do hook está coberta por um autoteste (46 verificações).
 
