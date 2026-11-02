@@ -13,6 +13,7 @@ Located at `.claude/runs/<run-id>/plan.json`. Only the orchestrator edits it.
 | `integration_branch`, `integration_dir` | `orch/<run-id>` and its worktree; writers merge here |
 | `retry_policy` | Back-off settings chosen at the start (see below) |
 | `paused_until`, `halted`, `waited_total_sec` | Run-wide pause after limit/proxy errors, halt reason, time spent waiting |
+| `union_files` | Concrete append-only files that concurrent writers may all change; merged with git's union driver |
 | `test_cmd` | Command run after each merge; a failure reverts that merge |
 | `max_parallel` | Concurrency per kind, defaults `read:6, synth:1, write:3, review:2` |
 | `tasks` | List of task objects |
@@ -25,7 +26,8 @@ Located at `.claude/runs/<run-id>/plan.json`. Only the orchestrator edits it.
 | `kind` | yes | `read`, `synth`, `write`, `review` |
 | `title` | yes | One line, what the task achieves |
 | `deps` | no | Ids that must be `done` first |
-| `write_set` | write only | Files, dirs or globs the task may change. Concurrent writers must be disjoint |
+| `write_set` | write only | Files, dirs or globs the task may change. Concurrent writers must be disjoint, except for shared files below |
+| `shared` | write only | Concrete files co-owned with other concurrent writers, as `{"path": "region label"}`; labels must differ between co-owners |
 | `model` | no | `haiku`, `sonnet`, `opus` |
 | `output` | no | Output file path relative to the run dir (defaults to `findings/<id>.md` or `results/<id>.md`) |
 | `status` | auto | `pending`, `running`, `waiting` (retry scheduled), `done`, `failed`, `blocked` |
@@ -34,6 +36,7 @@ Located at `.claude/runs/<run-id>/plan.json`. Only the orchestrator edits it.
 | `summary` | auto | The agent's one-line summary |
 | `branch` | auto | Writer's branch, recorded at completion |
 | `start_sha` | auto | Integration tip when a writer was launched; the commit it must build on |
+| `previous_branch` | auto | Branch of an earlier attempt, kept by `set pending` for a replay |
 | `merged` / `merge_note` | auto | Set by `integrate`; dependents of a writer unlock only when `merged` is true |
 | `started_at` | auto | Used by `stale` |
 
@@ -85,6 +88,7 @@ Change them at any time with `orch.py policy <run_dir> --limit-wait 1800 ...`.
 ## Choosing write-sets
 
 - Prefer directories or globs over single files; under-declaring is the usual error.
+- If several tasks genuinely need the same file, see *Shared files* in SKILL.md: scaffold first, `shared` regions, the `union` list, or fragments. A shared file is listed in `shared`, not in `write_set`.
 - If two tasks both need a shared file (types, config, lockfile), either give that file to one task and make the other depend on it, or extract it into its own earlier task.
 - Generated files and lockfiles belong to the integration phase, not to a writer.
 - If you cannot make write-sets disjoint, the work is sequential. Say so; do not force parallelism.

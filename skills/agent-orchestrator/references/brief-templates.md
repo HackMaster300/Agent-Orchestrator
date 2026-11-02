@@ -94,6 +94,12 @@ ALLOWED TO MODIFY (write-set)
 <globs>
 Do not touch anything else. If you believe another file must change, stop and report it under NEW_TASKS instead of editing it.
 
+SHARED FILES (include only if the task declares `shared`)
+You co-own <path> with other agents who are editing it at the same time in their own worktrees. Your region: <region>. Edit only inside it. Do not reformat, rename, reorder imports, or touch lines outside your region, and do not add anything at the end of the file unless your region is the end. Make each change one small contiguous hunk. If you cannot do your job without leaving your region, stop and report it under NEW_TASKS.
+
+FRAGMENTS (include only if the task writes a fragment)
+Do not edit <target>. Write your part to <run_dir>/fragments/<name> (plain content, ready to be concatenated; no headers for other sections). The orchestrator assembles the file.
+
 QUALITY BAR
 Follow the conventions in CONTEXT.md. Run <test/lint command> for the code you changed and make it pass. Do not weaken or delete tests to make them pass.
 
@@ -128,6 +134,14 @@ OUTPUT
 ```
 
 ---
+
+## Replay addendum (shared-file merge conflict)
+
+Use after `orch.py set <run_dir> <id> pending` and `set running`, appended to the original writer brief:
+```
+REPLAY
+Your previous attempt on branch <previous_branch> could not be merged because another agent changed lines next to yours. Read your earlier work with `git diff <old start_sha>..<previous_branch>`, then re-apply the same intent on the current code you were given. Do not copy the old diff blindly: the surrounding code has changed. Keep inside your region.
+```
 
 ## Retry addendum
 

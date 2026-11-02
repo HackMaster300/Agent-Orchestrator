@@ -33,7 +33,7 @@ def main():
     if not marker or not os.path.exists(marker):
         return 0  # not an orchestrated worktree
     info = json.load(open(marker))
-    from orch import in_write_set, load  # noqa: E402
+    from orch import effective_write_set, in_write_set, load  # noqa: E402
     plan = load(info["run_dir"])
     task = {t["id"]: t for t in plan["tasks"]}[info["task"]]
 
@@ -47,10 +47,10 @@ def main():
               f"Edit only files inside your own worktree.", file=sys.stderr)
         return 2
     rel = os.path.relpath(target, top_real)
-    if in_write_set(rel, task["write_set"]):
+    if in_write_set(rel, effective_write_set(task)):
         return 0
     print(f"[orchestrator] BLOCKED: {rel} is outside the write-set of task {task['id']} "
-          f"{task['write_set']}. Do not edit it. If it must change, stop and report it "
+          f"{effective_write_set(task)}. Do not edit it. If it must change, stop and report it "
           f"under NEW_TASKS.", file=sys.stderr)
     return 2
 

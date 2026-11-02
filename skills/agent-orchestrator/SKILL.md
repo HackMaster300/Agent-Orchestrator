@@ -75,10 +75,10 @@ Decompose the goal into tasks and write them into `plan.json` (schema and a work
 
 - `kind`: `read | synth | write | review`
 - `deps`: tasks whose output it needs. Be honest here; a false "independent" is the most expensive mistake.
-- `write_set`: for `write` tasks, the files/dirs/globs it may change. Two write tasks that can run at the same time must have disjoint write-sets.
+- `write_set`: for `write` tasks, the files/dirs/globs it may change. Two write tasks that can run at the same time must have disjoint write-sets, **unless** they co-own a file through `shared`, the `union` list, or fragments (see *Shared files*).
 - `model` and a one-line `title`.
 
-Build the plan by editing `plan.json` or with `orch.py add / update / remove` (each re-validates and refuses a bad plan; once agents are running it enforces every rule). Then validate:
+Build the plan by editing `plan.json` or with `orch.py add / update / remove` (each re-validates and refuses a bad plan; once agents are running it enforces every rule). Raise the ceilings when the graph is wide enough to use them (`orch.py policy <run_dir> --max-write 6 --max-read 10`); more agents also means more risk of hitting a rate limit, so tell the user the trade-off. Then validate:
 ```bash
 python <skill>/scripts/orch.py validate <run_dir>
 ```
@@ -129,6 +129,23 @@ Launch one read-only `review` agent that has **not** seen the process. Give it o
 python <skill>/scripts/orch.py land <run_dir>
 ```
 It prints the diff summary. **Do not merge into the user's branch yourself**; show them `git merge orch/<run-id>` (or a PR) and let them land it. Afterwards `orch.py cleanup <run_dir> --all` removes merged branches and worktrees. Finish with a short report: what was done, what was cut, where artifacts live, how many agents ran.
+
+## Shared files: several agents on the same file
+
+Speed often needs more than one agent in the same file. Do it with one of these, in this order of preference. Never by letting live agents edit one checkout at the same time (see the last item).
+
+1. **Scaffold first (best).** A small `write` task runs before the parallel wave and leaves one anchor per agent in the shared file: stub functions, import lines, registry entries, section headings. The wave then fills in separate blocks and the conflicts disappear before they start. When a file is a hot spot, plan this task.
+2. **Regions (same file, in parallel).** Declare the file in `shared` for each co-owner, each with a *different region label*:
+   ```bash
+   orch.py add <run_dir> --id w10 --kind write --title "users routes" --shared "src/routes.py=users section"
+   orch.py add <run_dir> --id w11 --kind write --title "orders routes" --shared "src/routes.py=orders section"
+   ```
+   `validate` accepts the overlap only when every co-owner names the same concrete file with a distinct region; globs, a duplicate region, or another writer whose `write_set` swallows the file are still rejected. The agents work in separate worktrees and git merges their hunks. Put the rules in the brief (template in `references/brief-templates.md`): stay inside your region, do not reformat or reorder imports, do not append at the end of the file, keep each change as one small contiguous hunk. Regions are enforced by git at merge time, not by the hook; the hook and `check-writeset` only see file names.
+3. **Union (append-only text).** For changelogs, requirements files, lists of entries: `orch.py union <run_dir> CHANGELOG.md`. Concurrent appends from any number of writers are merged keeping every side's lines. Never use it for code: two edits to the same line would both survive and break it.
+4. **Fragments (generated content).** Each agent writes its part to `<run_dir>/fragments/<name>` instead of the shared file, then `orch.py assemble <run_dir> --target docs/api.md --parts a.part,b.part` builds the file in order, commits it, and runs the tests. No conflicts are possible. Best for docs, reports, and lists of tests or endpoints.
+5. **Not supported: several live agents editing one file in the same checkout.** Edits are read-modify-write, so two agents can silently overwrite each other, and there is no isolation if one goes wrong. If the user asks for it, explain this and use 1 to 4 instead; they give the same parallelism safely.
+
+When a shared-file merge conflicts, `integrate` aborts that merge, keeps the others, and says so. Resolve by hand if it is a few lines; otherwise **replay**: `orch.py set <run_dir> <id> pending` (this keeps the old branch as `previous_branch`), then `set running` and relaunch with the replay addendum from the brief templates, so the agent re-applies its change on the new tip. Merge shared-file writers in a single `integrate` call: the first is clean by construction, the later ones are the ones that can conflict.
 
 ## Infrastructure errors: limits, proxy, network
 

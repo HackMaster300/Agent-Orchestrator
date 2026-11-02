@@ -19,9 +19,12 @@ Writer support
   merge-order <run_dir>               dry run of the merge order
   land <run_dir>                      summary + how to land the result
   cleanup <run_dir> [--all]           remove merged branches/worktrees
+Shared files (several concurrent agents on one file)
+  union <run_dir> [paths...] [--remove]   append-only files merged with git's union driver
+  assemble <run_dir> --target F --parts a,b   build one file from per-agent fragments
 Plan editing (re-validates; refuses invalid plans unless --force)
-  add <run_dir> --id ID --kind K --title T [--deps a,b] [--write-set g1,g2] [--model M]
-  update <run_dir> ID [--deps ..] [--write-set ..] [--model ..] [--title ..]
+  add <run_dir> --id ID --kind K --title T [--deps a,b] [--write-set g1,g2] [--shared f=region,..] [--model M]
+  update <run_dir> ID [--deps ..] [--write-set ..] [--shared ..] [--model ..] [--title ..]
   remove <run_dir> ID [--rewire]
 
 The orchestrator is the single writer of plan.json.
@@ -173,6 +176,40 @@ def concurrent(tasks, a, b):
     return b not in ancestors(tasks, a) and a not in ancestors(tasks, b)
 
 
+# ---------------------------------------------------------- shared files
+def effective_write_set(t):
+    """Files a writer may change: its write_set plus the concrete files it co-owns (`shared`)."""
+    return list(t.get("write_set", [])) + list(t.get("shared", {}).keys())
+
+
+def pair_allowed(plan, a, b, pa, pb):
+    """May two concurrent writers both hold overlapping patterns pa (task a) and pb (task b)?
+    Yes only for the same concrete file that is (1) in the plan's union list, or
+    (2) declared `shared` by both with different, non-empty regions."""
+    if pa != pb:
+        return False
+    if pa in plan.get("union_files", []):
+        return True
+    sa, sb = a.get("shared", {}), b.get("shared", {})
+    ra, rb = (sa.get(pa) or "").strip().lower(), (sb.get(pa) or "").strip().lower()
+    return bool(ra) and bool(rb) and ra != rb
+
+
+def blocking_overlaps(plan, a, b):
+    return [(pa, pb) for pa in effective_write_set(a) for pb in effective_write_set(b)
+            if patterns_overlap(pa, pb) and not pair_allowed(plan, a, b, pa, pb)]
+
+
+def parse_shared(text):
+    out = {}
+    for item in csv(text):
+        if "=" not in item:
+            die(f"--shared items look like path=region, got '{item}'")
+        path, region = item.split("=", 1)
+        out[path.strip()] = region.strip()
+    return out
+
+
 # ------------------------------------------------------------- plan checks
 def check_plan(plan, complete=True):
     """complete=False skips whole-plan rules (gate/review) so a plan can be built step by step."""
@@ -192,10 +229,15 @@ def check_plan(plan, complete=True):
         for d in t.get("deps", []):
             if d not in tasks:
                 errors.append(f"{tid}: unknown dependency '{d}'")
-        if t.get("kind") == "write" and not t.get("write_set"):
-            errors.append(f"{tid}: write task needs a non-empty write_set")
-        if t.get("kind") != "write" and t.get("write_set"):
-            errors.append(f"{tid}: only write tasks may declare a write_set")
+        if t.get("kind") == "write" and not effective_write_set(t):
+            errors.append(f"{tid}: write task needs a non-empty write_set (or shared files)")
+        if t.get("kind") != "write" and (t.get("write_set") or t.get("shared")):
+            errors.append(f"{tid}: only write tasks may declare a write_set or shared files")
+        for path, region in (t.get("shared") or {}).items():
+            if any(ch in path for ch in "*?["):
+                errors.append(f"{tid}: shared entry '{path}' must be one concrete file, not a glob")
+            if not (region or "").strip():
+                errors.append(f"{tid}: shared file '{path}' needs a region label (what part of it this task owns)")
         if not t.get("title"):
             warnings.append(f"{tid}: missing title")
 
@@ -221,11 +263,14 @@ def check_plan(plan, complete=True):
         writers = [t for t in tasks_list if t.get("kind") == "write"]
         for i, a in enumerate(writers):
             for b in writers[i + 1:]:
-                if concurrent(tasks, a["id"], b["id"]) and sets_overlap(a["write_set"], b["write_set"]):
-                    errors.append(
-                        f"write-set overlap between concurrent writers {a['id']} and {b['id']}: "
-                        f"add a dependency or split the files"
-                    )
+                if concurrent(tasks, a["id"], b["id"]):
+                    bad = blocking_overlaps(plan, a, b)
+                    if bad:
+                        errors.append(
+                            f"write-set overlap between concurrent writers {a['id']} and {b['id']} "
+                            f"on {sorted({x for pair in bad for x in pair})}: add a dependency, split the files, "
+                            f"declare the file `shared` in both with different regions, or add it to the union list"
+                        )
         has_read = any(t.get("kind") == "read" for t in tasks_list)
         synths = {t["id"] for t in tasks_list if t.get("kind") == "synth"}
         if has_read and complete:
@@ -295,7 +340,7 @@ def cmd_init(args):
         "waited_total_sec": 0,
         "paused_until": None,
         "halted": None,
-        "max_parallel": dict(DEFAULT_PARALLEL),
+        "max_parallel": {**DEFAULT_PARALLEL, **{k: v for k, v in (("read", args.max_read), ("write", args.max_write)) if v}},
         "tasks": [],
     }
     if sha:
@@ -350,7 +395,7 @@ def cmd_next(args):
     for t in running:
         slots[t["kind"]] = slots.get(t["kind"], 0) - 1
     launch = []
-    busy = [t["write_set"] for t in running if t["kind"] == "write"]
+    busy = [t for t in running if t["kind"] == "write"]
     for t in plan["tasks"]:
         st = t.get("status", "pending")
         if st not in ("pending", "waiting"):
@@ -362,9 +407,9 @@ def cmd_next(args):
         if slots.get(t["kind"], 0) <= 0:
             continue
         if t["kind"] == "write":
-            if any(sets_overlap(t["write_set"], ws) for ws in busy):
+            if any(blocking_overlaps(plan, t, b) for b in busy):
                 continue
-            busy.append(t["write_set"])
+            busy.append(t)
         slots[t["kind"]] -= 1
         launch.append(t)
     if not launch:
@@ -382,7 +427,9 @@ def cmd_next(args):
         print("nothing ready" + (" (agents still running)" if running else ""))
         return
     for t in launch:
-        extra = f" write_set={t['write_set']}" if t["kind"] == "write" else ""
+        extra = ""
+        if t["kind"] == "write":
+            extra = f" write_set={t.get('write_set', [])}" + (f" shared={t['shared']}" if t.get("shared") else "")
         print(f"{t['id']}\t{t['kind']}\t{t.get('model', '-')}\t{t.get('title', '')}{extra}")
     if any(t["kind"] == "write" for t in launch):
         print("# for writers: run `set <id> running` first; it records the start_sha they must use")
@@ -421,6 +468,8 @@ def cmd_set(args):
         t["infra_retries"] = 0
         t.pop("last_error", None)
     elif args.status == "pending":
+        if t.get("branch"):
+            t["previous_branch"] = t["branch"]  # lets a replay brief point at the earlier attempt
         for k in ("start_sha", "branch", "merged", "merge_note", "started_at", "next_retry_at", "infra_retries", "last_error"):
             t.pop(k, None)
     if args.summary:
@@ -539,6 +588,10 @@ def cmd_policy(args):
     if args.mode:
         plan["mode"] = args.mode
         changed = True
+    for kind, v in (("read", args.max_read), ("write", args.max_write)):
+        if v:
+            plan.setdefault("max_parallel", dict(DEFAULT_PARALLEL))[kind] = v
+            changed = True
     new = policy_from_args(args, base=policy_of(plan))
     if new != policy_of(plan):
         plan["retry_policy"] = new
@@ -546,6 +599,7 @@ def cmd_policy(args):
     if changed:
         save(run_dir, plan)
     print(f"mode: {plan['mode']}")
+    print(f"  max_parallel: {plan.get('max_parallel', DEFAULT_PARALLEL)}")
     for k, v in policy_of(plan).items():
         print(f"  {k}: {v}")
 
@@ -591,7 +645,7 @@ def cmd_bootstrap(args):
         with open(exclude, "a") as f:
             f.write(f"\n{MARKER}\n")
     br = git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
-    print(f"ready: task={t['id']} start_sha={start[:10]} branch={br}\nwrite_set={t['write_set']}")
+    print(f"ready: task={t['id']} start_sha={start[:10]} branch={br}\nwrite_set={effective_write_set(t)}")
 
 
 def writeset_violations(plan, t):
@@ -601,7 +655,7 @@ def writeset_violations(plan, t):
     if r.returncode:
         die(f"git diff failed for {t['id']}: {r.stderr.strip()}")
     files = [f for f in r.stdout.splitlines() if f]
-    return files, [f for f in files if not in_write_set(f, t["write_set"])]
+    return files, [f for f in files if not in_write_set(f, effective_write_set(t))]
 
 
 def cmd_check_writeset(args):
@@ -647,6 +701,30 @@ def cmd_merge_order(args):
         print(f"{i}. {t['id']}\t{t.get('branch', '(no branch)')}\t{t.get('title', '')}")
 
 
+def sync_union_attrs(plan, active=True):
+    """Make git merge the plan's append-only files with the built-in `union` driver
+    (keeps both sides' lines). Stored in the repo-local info/attributes between markers."""
+    idir = plan.get("integration_dir")
+    if not idir or not os.path.isdir(idir):
+        return
+    p = git(["rev-parse", "--git-path", "info/attributes"], cwd=idir).stdout.strip()
+    p = p if os.path.isabs(p) else os.path.join(idir, p)
+    begin, end = f"# orch:{plan['run_id']} begin", f"# orch:{plan['run_id']} end"
+    lines = open(p).read().splitlines() if os.path.exists(p) else []
+    out, skip = [], False
+    for ln in lines:
+        if ln == begin:
+            skip = True
+        elif ln == end:
+            skip = False
+        elif not skip:
+            out.append(ln)
+    if active and plan.get("union_files"):
+        out += [begin] + [f"{f} merge=union" for f in plan["union_files"]] + [end]
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    open(p, "w").write("\n".join(out) + ("\n" if out else ""))
+
+
 def cmd_integrate(args):
     run_dir = os.path.abspath(args.run_dir)
     plan = load(run_dir)
@@ -658,6 +736,7 @@ def cmd_integrate(args):
         print("nothing to integrate")
         return
     problems = 0
+    sync_union_attrs(plan)
     for t in seq:
         tid = t["id"]
         if not t.get("branch"):
@@ -677,8 +756,15 @@ def cmd_integrate(args):
             conflicts = git(["diff", "--name-only", "--diff-filter=U"], cwd=idir).stdout.split()
             git(["merge", "--abort"], cwd=idir)
             t["merge_note"] = "conflict: " + ", ".join(conflicts[:3]) if conflicts else "merge failed"
-            print(f"[{tid}] CONFLICT in {conflicts or r.stderr.strip()}; merge aborted. "
-                  f"The write-set was probably wrong. Resolve manually or re-scope.")
+            shared = set(t.get("shared", {}))
+            if conflicts and all(c in shared for c in conflicts):
+                print(f"[{tid}] CONFLICT in shared file(s) {conflicts}: another agent changed lines next to "
+                      f"yours. Merge aborted. Options: resolve by hand if small, or REPLAY: "
+                      f"`set {tid} pending`, relaunch with the replay addendum so the agent re-applies "
+                      f"its change on the current tip (it keeps `previous_branch`).")
+            else:
+                print(f"[{tid}] CONFLICT in {conflicts or r.stderr.strip()}; merge aborted. "
+                      f"The write-set was probably wrong. Resolve manually or re-scope.")
             problems += 1
             continue
         if plan.get("test_cmd"):
@@ -737,6 +823,8 @@ def cmd_cleanup(args):
             git(["worktree", "remove", "--force", wts[b]], cwd=cwd)
         r = git(["branch", "-D", b], cwd=cwd)
         print(f"{t['id']}: removed {b}" if r.returncode == 0 else f"{t['id']}: {r.stderr.strip()}")
+    if args.all:
+        sync_union_attrs(plan, active=False)
     if args.all and plan.get("integration_dir") and os.path.isdir(plan["integration_dir"]):
         git(["worktree", "remove", "--force", plan["integration_dir"]], cwd=cwd)
         print(f"removed integration worktree (branch {plan['integration_branch']} kept until you delete it)")
@@ -744,6 +832,61 @@ def cmd_cleanup(args):
     left = [t["id"] for t in plan["tasks"] if t.get("branch") and not t.get("merged")]
     if left:
         print(f"kept branches of unmerged writers: {', '.join(left)}")
+
+
+# ------------------------------------------------------- shared-file tools
+def cmd_union(args):
+    run_dir = os.path.abspath(args.run_dir)
+    plan = load(run_dir)
+    cur = plan.setdefault("union_files", [])
+    for pth in args.paths:
+        if any(ch in pth for ch in "*?["):
+            die(f"'{pth}' must be a concrete file path, not a glob")
+        if args.remove and pth in cur:
+            cur.remove(pth)
+        elif not args.remove and pth not in cur:
+            cur.append(pth)
+    save(run_dir, plan)
+    print("union files (concurrent appends are merged, both sides kept): " + (", ".join(cur) or "none"))
+    if cur:
+        print("only use this for append-only text (changelogs, requirements, lists), never for code")
+
+
+def cmd_assemble(args):
+    run_dir = os.path.abspath(args.run_dir)
+    plan = load(run_dir)
+    idir = plan.get("integration_dir")
+    if not idir or not os.path.isdir(idir):
+        die("no integration worktree")
+    frag = os.path.join(run_dir, "fragments")
+    names = csv(args.parts)
+    missing = [n for n in names if not os.path.isfile(os.path.join(frag, n))]
+    if missing:
+        die(f"missing fragment file(s) in {frag}: {', '.join(missing)}")
+    target = os.path.normpath(os.path.join(idir, args.target))
+    if not target.startswith(os.path.normpath(idir) + os.sep):
+        die("target must stay inside the repository")
+    if os.path.exists(target) and not (args.overwrite or args.append):
+        die(f"{args.target} already exists; pass --append or --overwrite")
+    chunks = []
+    for n in names:
+        txt = open(os.path.join(frag, n)).read()
+        chunks.append(txt if txt.endswith("\n") else txt + "\n")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    pre = git(["rev-parse", "HEAD"], cwd=idir).stdout.strip()
+    with open(target, "a" if args.append else "w") as f:
+        f.write("".join(chunks))
+    git(["add", args.target], cwd=idir)
+    r = git(["commit", "-m", f"orch: assemble {args.target} from {len(names)} fragments"], cwd=idir)
+    if r.returncode:
+        die(f"commit failed: {r.stderr.strip() or r.stdout.strip()}")
+    if plan.get("test_cmd"):
+        tr = run(plan["test_cmd"], cwd=idir, shell=True)
+        if tr.returncode:
+            git(["reset", "--hard", pre], cwd=idir)
+            tail = (tr.stdout + tr.stderr).strip().splitlines()[-8:]
+            die("tests failed after assembling; reverted.\n    " + "\n    ".join(tail))
+    print(f"assembled {args.target} from {len(names)} fragments -> {git(['rev-parse', '--short', 'HEAD'], cwd=idir).stdout.strip()}")
 
 
 # ------------------------------------------------------------ plan edits
@@ -769,6 +912,8 @@ def cmd_add(args):
         t["model"] = args.model
     if csv(args.write_set):
         t["write_set"] = csv(args.write_set)
+    if args.shared:
+        t["shared"] = parse_shared(args.shared)
     plan["tasks"].append(t)
     commit_edit(run_dir, plan, args.force)
 
@@ -783,6 +928,11 @@ def cmd_update(args):
         t["deps"] = csv(args.deps)
     if args.write_set is not None:
         t["write_set"] = csv(args.write_set)
+    if args.shared is not None:
+        if args.shared.strip():
+            t["shared"] = parse_shared(args.shared)
+        else:
+            t.pop("shared", None)
     if args.model:
         t["model"] = args.model
     if args.title:
@@ -814,6 +964,8 @@ def add_policy_flags(s):
     s.add_argument("--max-retries", dest="max_retries", type=int, help="infra retries per task")
     s.add_argument("--max-total-wait", dest="max_total_wait", type=int, help="total minutes the run may wait")
     s.add_argument("--on-exhausted", dest="on_exhausted", choices=["pause", "ask", "skip"])
+    s.add_argument("--max-read", dest="max_read", type=int, help="concurrent read agents (default 6)")
+    s.add_argument("--max-write", dest="max_write", type=int, help="concurrent write agents (default 3)")
 
 
 def main():
@@ -851,6 +1003,14 @@ def main():
     s.add_argument("--mode", choices=["checkpoint", "auto"])
     add_policy_flags(s)
     sp("resume", cmd_resume)
+    s = sp("union", cmd_union)
+    s.add_argument("paths", nargs="*")
+    s.add_argument("--remove", action="store_true")
+    s = sp("assemble", cmd_assemble)
+    s.add_argument("--target", required=True)
+    s.add_argument("--parts", required=True, help="comma-separated fragment file names under <run_dir>/fragments/")
+    s.add_argument("--overwrite", action="store_true")
+    s.add_argument("--append", action="store_true")
     sp("bootstrap", cmd_bootstrap, "task_id")
     sp("check-writeset", cmd_check_writeset, "task_id")
     s = sp("integrate", cmd_integrate)
@@ -862,11 +1022,13 @@ def main():
         s.add_argument(a, required=True)
     s.add_argument("--deps")
     s.add_argument("--write-set", dest="write_set")
+    s.add_argument("--shared", help="co-owned files as path=region,path=region")
     s.add_argument("--model")
     s.add_argument("--force", action="store_true")
     s = sp("update", cmd_update, "id")
     s.add_argument("--deps")
     s.add_argument("--write-set", dest="write_set")
+    s.add_argument("--shared", help="co-owned files as path=region,...; empty string clears")
     s.add_argument("--model")
     s.add_argument("--title")
     s.add_argument("--force", action="store_true")

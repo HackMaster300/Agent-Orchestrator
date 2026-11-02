@@ -2,9 +2,9 @@
 
 <img src="docs/img/zharak-logo-small.png" alt="Zharak" height="32" align="absmiddle">&nbsp; **Developed by Zharak**
 
-Uma skill do Claude Code para coordenar **múltiplos subagentes em paralelo** num trabalho que mistura pesquisa e código, sem colisões, sem perder o estado, o contexto e sem gastar tokens desnecessariamente.
+Uma skill do Claude Code para coordenar **muitos subagentes em paralelo** num trabalho que mistura pesquisa e código, sem colisões, sem perder o estado e sem gastar tokens à toa.
 
-> **Estado:** a lógica dos scripts e do hook está coberta por um autoteste (46 verificações).
+> **Estado:** a lógica dos scripts e do hook está coberta por um autoteste (65 verificações, sem agentes). O comportamento em sessões reais do Claude Code ainda **não foi validado**; há um protocolo de oito experiências para isso em [`verify-assumptions.md`](skills/agent-orchestrator/references/verify-assumptions.md). Ver [Limitações](#limitações-e-estado).
 
 ![Visão geral](docs/img/01-overview.svg)
 
@@ -56,6 +56,23 @@ Há ainda dois tipos de tarefa: `synth` (o **portão de síntese**, que condensa
 3. **Quando as retentativas acabam**: parar e avisar-te, perguntar-te, ou saltar a tarefa e continuar com as independentes.
 
 Por defeito há **dois checkpoints** (A: depois do plano, B: depois da síntese) onde pára para aprovação. Com `--auto` salta-os, mas continua a parar se a síntese detetar contradições.
+
+### Vários agentes no mesmo ficheiro
+
+Por defeito dois escritores simultâneos não podem ter o mesmo ficheiro, porque se sobrescreviam. Quando é preciso, a skill oferece quatro formas seguras (por ordem de preferência):
+
+![Ficheiros partilhados](docs/img/05-shared-files.svg)
+
+| Forma | Como funciona | Bom para |
+|---|---|---|
+| **Andaime primeiro** | Uma tarefa curta deixa uma âncora por agente (funções vazias, imports, entradas de registo) e depois todos preenchem blocos diferentes | Qualquer ficheiro "quente": é a que evita conflitos |
+| **Regiões** (`--shared`) | Cada agente declara o ficheiro e uma região própria; trabalham em worktrees separados e o git junta os blocos | Código no mesmo ficheiro, em zonas diferentes |
+| **Union** (`orch.py union`) | Anexos simultâneos são todos mantidos pelo git | Changelogs, requirements, listas (nunca código) |
+| **Fragmentos** (`orch.py assemble`) | Cada agente escreve a sua parte num ficheiro à parte e o orquestrador monta o resultado | Documentação, relatórios, listas de testes |
+
+Se duas regiões tocarem em linhas vizinhas, o `integrate` aborta só esse merge, avisa, e a tarefa pode ser **repetida** (*replay*) sobre o código atual, com o ramo anterior como referência.
+
+**Não suportado:** vários agentes vivos a editar o mesmo ficheiro no mesmo checkout. Cada edição lê e reescreve o ficheiro, por isso dois agentes podem apagar o trabalho um do outro sem aviso. As quatro formas acima dão o mesmo paralelismo sem esse risco.
 
 ### Limites de uso, proxy e erros de rede
 
@@ -127,6 +144,8 @@ O Claude usa-os por ti; ficam documentados para depurar ou retomar uma corrida.
 | `error <dir> <id> --kind K` | Regista um erro de limite/proxy/rede e aplica a política de espera |
 | `policy <dir>` | Mostra ou altera o modo e a política de retentativas |
 | `resume <dir>` | Retoma uma corrida parada depois de resolveres a causa |
+| `union <dir> <ficheiros>` | Marca ficheiros só de anexos para fusão por *union* |
+| `assemble <dir> --target F --parts a,b` | Monta um ficheiro a partir de fragmentos |
 | `bootstrap <dir> <id>` | Passo 0 do escritor: posiciona o worktree e arma o hook |
 | `check-writeset <dir> <id>` | O escritor ficou dentro do seu write-set? |
 | `integrate <dir>` | Verifica, junta, testa e reverte se falhar |
@@ -136,6 +155,16 @@ O Claude usa-os por ti; ficam documentados para depurar ou retomar uma corrida.
 ### Poupança de tokens
 
 Os ficheiros carregam os dados e as mensagens carregam só ponteiros: cada agente devolve no máximo 5 linhas e escreve o resto num ficheiro. O `DECISIONS.md` funciona como compressão (dez findings viram uma página) e os escritores leem só isso. O modelo é o mais barato que serve: Haiku explora, Sonnet analisa e implementa, Opus planeia e sintetiza. Lança-se por ondas, nunca "tudo de uma vez", e abaixo de três unidades independentes de trabalho a skill recomenda não paralelizar.
+
+## Limitações e estado
+
+- **Não validada em sessões reais.** Parte do desenho assume comportamentos do Claude Code que não pude confirmar: lançamento em paralelo numa só mensagem, o worktree arrancar do branch por defeito, subagentes que não lançam subagentes, notificações de conclusão. O protocolo [`verify-assumptions.md`](skills/agent-orchestrator/references/verify-assumptions.md) confirma cada um em cerca de um minuto.
+- **As regiões dependem de os agentes as respeitarem.** O hook e o `check-writeset` só veem nomes de ficheiros, não linhas; é o git que apanha o excesso, no merge.
+- **O hook não vê comandos de shell** (`sed -i`, redirecionamentos). O `integrate` apanha-os depois, por `check-writeset`, antes de juntar.
+- **Conflitos semânticos** (ficheiros diferentes que quebram a interface um do outro) só são apanhados pelos testes e pelo revisor; as interfaces devem ficar fixadas no `DECISIONS.md`.
+- **Os textos de erro são exemplos.** A tabela de classificação (429, 5xx, proxy…) baseia-se em padrões comuns; a experiência E8 de [`verify-assumptions.md`](skills/agent-orchestrator/references/verify-assumptions.md) confirma o que o Claude Code mostra de facto. E a skill não consegue esperar para além do limite da própria sessão.
+- **Sem estimativa de custo** por tarefa ainda; os orçamentos de ficheiros e de tamanho são instruções, não limites impostos.
+- Depende de git; não há modo só-leitura sem git.
 
 ## Estrutura
 
@@ -166,7 +195,7 @@ O `SKILL.md` e as referências estão em inglês porque é a língua em que o Cl
 python3 skills/agent-orchestrator/scripts/selftest.py
 ```
 
-Cria um repositório temporário, simula escritores com worktrees reais e verifica: bootstrap, write-sets, integração por ondas, conflitos, reversão por testes falhados, edição do plano, o hook, e a política de retentativas (espera, pausa global, esgotamento e retoma).
+Cria um repositório temporário, simula escritores com worktrees reais e verifica: bootstrap, write-sets, integração por ondas, conflitos, reversão por testes falhados, edição do plano, o hook, e a política de retentativas (espera, pausa global, esgotamento e retoma) e os ficheiros partilhados (regiões, conflito, union e fragmentos).
 
 ## Licença
 
