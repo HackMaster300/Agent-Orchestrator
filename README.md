@@ -163,6 +163,7 @@ Os ficheiros carregam os dados e as mensagens carregam só ponteiros: cada agent
 ├── README.md
 ├── LICENSE                           # Apache-2.0
 ├── NOTICE                            # autoria Zharak
+├── CONTRIBUTING.md                   # como contribuir
 ├── docs/img/                         # diagramas e logótipo deste README
 └── skills/agent-orchestrator/
     ├── SKILL.md                      # instruções para o Claude (em inglês)
@@ -186,6 +187,10 @@ python3 skills/agent-orchestrator/scripts/selftest.py
 ```
 
 Cria um repositório temporário, simula escritores com worktrees reais e verifica: bootstrap, write-sets, integração por ondas, conflitos, reversão por testes falhados, edição do plano, o hook, e a política de retentativas (espera, pausa global, esgotamento e retoma) e os ficheiros partilhados (regiões, conflito, union e fragmentos).
+
+## Contribuir
+
+A comunidade é bem-vinda: validação em sessões reais, melhorias aos scripts, diagramas e documentação. Ver [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Licença
 
